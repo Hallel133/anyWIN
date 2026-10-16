@@ -8,6 +8,27 @@ anyWIN converts Windows x86-64 game executables (PE/COFF `.exe` plus the `.dll`s
 
 - **No emulator process and no separate runtime.** A static *relinker* rewrites the input executable into the host's native executable format, and the OS loader binds its imports to native reimplementations of the Windows system libraries.
 - Only **system** libraries are reimplemented (the ones that reach the kernel or hardware: `ntdll`, `kernel32`/`kernelbase`, `user32`, `gdi32`, `d3d*`/`dxgi`, `xinput`, `xaudio2`/`dsound`, `ws2_32`, ...). DLLs the game ships itself (MSVC runtime `vcruntime140`/`msvcp140`, middleware such as FMOD, Bink, PhysX) are converted by the relinker and loaded as-is, not replaced.
+- **Not a Wine prefix.** The result looks and behaves like a Mac app, and only what the game needs is shipped (see below). Hand-made per-game decompilation is out of scope; anything the tool does must work without per-title manual work.
+
+## Conversion tiers
+
+The tool tries these in order for each input:
+
+1. **Engine swap (fully native arm64, no Rosetta).** Detect the game's engine and replace the Windows runtime with that engine's macOS runtime, keeping the game's own data and managed code: Unity Mono builds (Mac player of the exact same Unity version; the `Managed/*.dll` assemblies are portable), XNA/FNA/MonoGame (FNA), Godot (`.pck` with a macOS export template), RPG Maker XP/VX/Ace (MKXP-Z), Ren'Py, LÖVE, Java. Engine runtimes that are proprietary (e.g. the Unity Mac player) are never bundled: the user points the tool at their own installed copy. Unity IL2CPP builds are native x86-64 code and go to tier 2. Engine detection must be exact (version, scripting backend); a mismatch fails instead of guessing.
+2. **Relink (x86-64 under Rosetta 2).** Everything else goes through the relinker and the reimplemented system libraries described below.
+
+## Mac-native behaviour of the reimplemented libraries
+
+- UI that Windows draws itself is mapped to Cocoa, not imitated: `GetOpenFileName`/`GetSaveFileName`/`IFileDialog` → `NSOpenPanel`/`NSSavePanel`, `MessageBox` → `NSAlert`, windows → `NSWindow` with a Metal layer, menus → the macOS menu bar.
+- No fake `C:` drive and no full registry. Paths are translated at the `kernel32` file API boundary (game folder, `%APPDATA%`/`%LOCALAPPDATA%` → `~/Library/Application Support/<game>`, `Documents` → `~/Documents`). Registry access is served from a small per-game store, populated only with keys the game reads.
+- **Minimal footprint.** The relinker knows every import of the executable and its shipped DLLs; the output bundle contains only the reimplemented libraries those imports reach. Output is a `.app` bundle.
+
+## Mods
+
+Mods for PC games are usually DLLs placed in the game folder, often proxy DLLs named like a system DLL (`dinput8.dll`, `winhttp.dll`, `dxgi.dll`, as used by Elden Ring mod loaders) that hook game code at run time (MinHook-style code patching). Rules that follow:
+
+- A DLL in the game folder is game-shipped even when its name matches a system DLL: convert it, never replace it with the reimplementation. Its forwards and `LoadLibrary`/`GetProcAddress` calls to the real system DLL must resolve to `core/libs/win32`.
+- Runtime code patching works because game code stays x86-64 under Rosetta; `VirtualProtect`, `FlushInstructionCache` and executable allocations must behave like Windows. This is one more reason tier 2 does not recompile to arm64.
 
 ## Current state
 
@@ -29,7 +50,7 @@ game/                      relinker (core/relinker)                    output (m
 
 ### Hard constraints that shape the design
 
-- **CPU: output is x86-64 Mach-O run under Rosetta 2.** Windows games are x86-64 and Apple Silicon is arm64; Rosetta is the OS-provided translator, which keeps the "no emulator" model. AnyPS5 already emits x86-64 Mach-O for Rosetta (`--macos --to-rosetta`, see `core/relinker/elfpatcher/src/macos` and `core/relinker/codegen` there), including lowering instructions Rosetta lacks (RDSEED→RDRAND, CLWB→NOP, RDPID). Native arm64 static recompilation is a separate, much larger effort; do not mix it into the Rosetta path.
+- **CPU: output is x86-64 Mach-O run under Rosetta 2.** Windows games are x86-64 and Apple Silicon is arm64; Rosetta is the OS-provided translator, which keeps the "no emulator" model. AnyPS5 already emits x86-64 Mach-O for Rosetta (`--macos --to-rosetta`, see `core/relinker/elfpatcher/src/macos` and `core/relinker/codegen` there), including lowering instructions Rosetta lacks (RDSEED→RDRAND, CLWB→NOP, RDPID). Native arm64 static recompilation is a separate, much larger effort; do not mix it into the Rosetta path. It would also likely be slower than Rosetta: x86 code assumes a TSO memory model, and Apple Silicon's hardware TSO mode is enabled by macOS only for Rosetta processes, so recompiled arm64 code would need memory barriers everywhere.
 - **64-bit only.** Rosetta 2 does not run 32-bit x86 code, so 32-bit PE (`IMAGE_FILE_MACHINE_I386`) input is rejected.
 - **Calling convention.** Game code uses the Microsoft x64 ABI (RCX, RDX, R8, R9, 32-byte shadow space, RSI/RDI/XMM6–15 callee-saved); macOS uses System V. Every export in `core/libs/win32` and every callback into game code must be declared `__attribute__((ms_abi))` (Clang supports it on x86-64 Darwin), and varargs need `__builtin_ms_va_list`.
 - **TEB/PEB via GS.** Windows code reads `gs:[0x30]` (TEB), `gs:[0x58]` (TLS array), `gs:[0x60]` (PEB). macOS reserves GS for its own thread-specific data, so the relinker's codegen pass must rewrite GS-relative accesses in game code and shipped DLLs; it cannot rely on setting the GS base.
